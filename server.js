@@ -7,7 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // 🔥 Увеличенный лимит на размер запроса (критично для Janitor AI)
-const BODY_LIMIT = '50mb';   // При необходимости можно увеличить до '100mb'
+const BODY_LIMIT = '5000mb';   // При необходимости можно увеличить до '100mb'
 
 
 // Middleware
