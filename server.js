@@ -7,14 +7,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // 🔥 Увеличенный лимит на размер запроса (критично для Janitor AI)
-const BODY_LIMIT = '5000mb';   // При необходимости можно увеличить до '100mb'
-
+const BODY_LIMIT = '5000mb';   
 
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: BODY_LIMIT }));
 app.use(express.urlencoded({ limit: BODY_LIMIT, extended: true }));
-
 
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
@@ -130,10 +128,10 @@ app.post('/v1/chat/completions', async (req, res) => {
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         
-        lines.forEach(line => {
+        for (const line of lines) {
           if (line.startsWith('data: ')) {
             if (line.includes('[DONE]')) {
-              res.write(line + '\n');
+              res.write(line + '\n\n');
               return;
             }
             
@@ -162,23 +160,26 @@ app.post('/v1/chat/completions', async (req, res) => {
                   
                   if (combinedContent) {
                     data.choices[0].delta.content = combinedContent;
-                    delete data.choices[0].delta.reasoning_content;
-                  }
-                } else {
-                  if (content) {
-                    data.choices[0].delta.content = content;
                   } else {
-                    data.choices[0].delta.content = '';
+                    continue; // Пропускаем отправку пустого чанка размышлений
                   }
+                  delete data.choices[0].delta.reasoning_content;
+                } else {
+                  // КРИТИЧЕСКИЙ ФИКС: Игнорируем пустые чанки размышлений, если показ отключен
+                  if (!content) {
+                    continue; 
+                  }
+                  data.choices[0].delta.content = content;
                   delete data.choices[0].delta.reasoning_content;
                 }
               }
               res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e) {
-              res.write(line + '\n');
+              // Если строка сломалась, возвращаем кусок в буфер
+              buffer = line + '\n' + buffer;
             }
           }
-        });
+        }
       });
       
       response.data.on('end', () => res.end());
