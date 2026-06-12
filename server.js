@@ -1,7 +1,6 @@
 // server.js - OpenAI to NVIDIA NIM API Proxy
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,7 +21,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
 
 // 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = true; // Set to true to enable chat_template_kwargs thinking parameter
+const ENABLE_THINKING_MODE = false; // По умолчанию выключено для исключения задержек DeepSeek
 
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
@@ -65,35 +64,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // Smart model selection with fallback
-    let nimModel = MODEL_MAPPING[model];
-    if (!nimModel) {
-      try {
-        await axios.post(`${NIM_API_BASE}/chat/completions`, {
-          model: model,
-          messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 1
-        }, {
-          headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-          validateStatus: (status) => status < 500
-        }).then(res => {
-          if (res.status >= 200 && res.status < 300) {
-            nimModel = model;
-          }
-        });
-      } catch (e) {}
-      
-      if (!nimModel) {
-        const modelLower = model.toLowerCase();
-        if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
-          nimModel = 'meta/llama-3.1-405b-instruct';
-        } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
-          nimModel = 'meta/llama-3.1-70b-instruct';
-        } else {
-          nimModel = 'meta/llama-3.1-8b-instruct';
-        }
-      }
-    }
+    // Smart model selection
+    let nimModel = MODEL_MAPPING[model] || model;
     
     // Transform OpenAI request to NIM format
     const nimRequest = {
@@ -105,45 +77,57 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+    // Используем нативный fetch вместо axios для стабильного стриминга через Vercel
+    const response = await fetch(`${NIM_API_BASE}/chat/completions`, {
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      responseType: stream ? 'stream' : 'json'
+      body: JSON.stringify(nimRequest)
     });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`NIM API error (${response.status}): ${errText}`);
+    }
     
     if (stream) {
-      // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
       let buffer = '';
       let reasoningStarted = false;
       
-      response.data.on('data', (chunk) => {
-        buffer += chunk.toString();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            if (line.includes('[DONE]')) {
-              res.write(line + '\n\n');
-              return;
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          
+          if (trimmed.startsWith('data: ')) {
+            if (trimmed.includes('[DONE]')) {
+              res.write('data: [DONE]\n\n');
+              return res.end();
             }
             
             try {
-              const data = JSON.parse(line.slice(6));
+              const data = JSON.parse(trimmed.slice(6));
               if (data.choices?.[0]?.delta) {
                 const reasoning = data.choices[0].delta.reasoning_content;
                 const content = data.choices[0].delta.content;
                 
                 if (SHOW_REASONING) {
                   let combinedContent = '';
-                  
                   if (reasoning && !reasoningStarted) {
                     combinedContent = '<think>\n' + reasoning;
                     reasoningStarted = true;
@@ -161,11 +145,11 @@ app.post('/v1/chat/completions', async (req, res) => {
                   if (combinedContent) {
                     data.choices[0].delta.content = combinedContent;
                   } else {
-                    continue; // Пропускаем отправку пустого чанка размышлений
+                    continue; 
                   }
                   delete data.choices[0].delta.reasoning_content;
                 } else {
-                  // КРИТИЧЕСКИЙ ФИКС: Игнорируем пустые чанки размышлений, если показ отключен
+                  // НАДЕЖНЫЙ ФИКС: Если основного контента нет, отбрасываем чанк, чтобы Janitor не зависал
                   if (!content) {
                     continue; 
                   }
@@ -175,60 +159,40 @@ app.post('/v1/chat/completions', async (req, res) => {
               }
               res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e) {
-              // Если строка сломалась, возвращаем кусок в буфер
+              // Если JSON сломался из-за разрыва строки, возвращаем ее обратно в буфер
               buffer = line + '\n' + buffer;
             }
           }
         }
-      });
-      
-      response.data.on('end', () => res.end());
-      response.data.on('error', (err) => {
-        console.error('Stream error:', err);
-        res.end();
-      });
+      }
+      res.end();
     } else {
-      // Transform NIM response to OpenAI format with reasoning
+      const data = await response.json();
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: model,
-        choices: response.data.choices.map(choice => {
+        choices: data.choices.map(choice => {
           let fullContent = choice.message?.content || '';
-          
           if (SHOW_REASONING && choice.message?.reasoning_content) {
             fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
           }
-          
           return {
             index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
+            message: { role: choice.message.role, content: fullContent },
             finish_reason: choice.finish_reason
           };
         }),
-        usage: response.data.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
+        usage: data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       };
-      
       res.json(openaiResponse);
     }
     
   } catch (error) {
     console.error('Proxy error:', error.message);
-    
-    res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
+    res.status(500).json({
+      error: { message: error.message || 'Internal server error', type: 'invalid_request_error', code: 500 }
     });
   }
 });
